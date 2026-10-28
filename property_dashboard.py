@@ -238,6 +238,7 @@ def init_db():
         ("service_charge_annual", "INTEGER"), ("ground_rent_annual", "INTEGER"),
         ("is_reduced", "INTEGER"), ("is_sstc", "INTEGER"), ("floorplan_url", "TEXT"),
         ("added_date", "TEXT"), ("is_watchlisted", "INTEGER"),
+        ("prev_price", "INTEGER"), ("new_last_run", "INTEGER"), ("dropped_last_run", "INTEGER"),
     ]
     for col, coltype in new_cols:
         if col not in existing_cols:
@@ -306,7 +307,8 @@ def get_all_listings(conn):
         first_seen_date = datetime.datetime.fromisoformat(d["first_seen"])
         last_seen_date = datetime.datetime.fromisoformat(d["last_seen"])
         d["days_tracked"] = (today - first_seen_date).days
-        d["is_new"] = d["days_tracked"] == 0
+        d["is_new"] = bool(d.get("new_last_run"))          # new in the most recent run
+        d["dropped_last_run"] = bool(d.get("dropped_last_run"))  # price fell in the most recent run
         d["days_since_last_seen"] = (today - last_seen_date).days
         d["is_stale"] = d["days_since_last_seen"] > STALE_AFTER_DAYS
         if d["added_date"]:
@@ -979,6 +981,8 @@ def run(auto_mode=False):
 
     new_count = 0
     new_titles = []
+    new_urls = set()
+    dropped_urls = {}
     price_drop_events = []
     newly_sstc = []
     for record in all_records:
@@ -987,15 +991,25 @@ def run(auto_mode=False):
         ).fetchone()
         is_new = upsert_listing(conn, record)
         if is_new:
+            new_urls.add(record["url"])
             new_count += 1
             new_titles.append(f"{record['title']} ({record['area']})")
         elif prior:
             prior_price, prior_sstc = prior
             if prior_price is not None and record["price"] is not None and record["price"] < prior_price:
                 price_drop_events.append((record["title"], prior_price, record["price"]))
+                dropped_urls[record["url"]] = prior_price
             if not prior_sstc and record["is_sstc"]:
                 newly_sstc.append(record["title"])
     print(f"\nThis run: {len(all_records)} listings checked, {new_count} new")
+
+    # Remember what changed in THIS run so the dashboard can filter to it.
+    conn.execute("UPDATE listings SET new_last_run = 0, dropped_last_run = 0")
+    for u in new_urls:
+        conn.execute("UPDATE listings SET new_last_run = 1 WHERE url = ?", (u,))
+    for u, old_price in dropped_urls.items():
+        conn.execute("UPDATE listings SET dropped_last_run = 1, prev_price = ? WHERE url = ?", (old_price, u))
+    conn.commit()
 
     archived = archive_stale_listings(conn)
     if archived:
@@ -1181,6 +1195,12 @@ def write_dashboard(records, changes_text=""):
   .whatsnew summary { cursor: pointer; color: var(--brand); font-weight: 600; }
   .whatsnew pre { white-space: pre-wrap; font-family: "IBM Plex Mono", monospace; font-size: 12px;
     background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 8px 0 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+  .chip { background: var(--brand-soft); color: var(--brand); border: 1px solid var(--brand); border-radius: 999px;
+    padding: 7px 14px; font-size: 14px; font-weight: 600; }
+  .chip:has(input:checked) { background: var(--brand); color: #fff; }
+  .chip input { display: none; }
+  .chip-n { font-family: "IBM Plex Mono", monospace; font-weight: 500; margin-left: 4px; opacity: .85; }
   #filter-toggle, #sort-select, #cards { display: none; }
   #filter-box { display: contents; }
 
@@ -1234,6 +1254,10 @@ __AREA_CARDS__
 
 <h2 class="section-label">Listings</h2>
 <div class="controls">
+  <div class="chips">
+    <label class="chip"><input type="checkbox" id="f-new"> New since last run <span class="chip-n" id="n-new"></span></label>
+    <label class="chip"><input type="checkbox" id="f-droplast"> Price drops last run <span class="chip-n" id="n-droplast"></span></label>
+  </div>
   <select id="area-select">
     <option value="">All areas</option>
     __AREA_OPTIONS__
@@ -1261,8 +1285,7 @@ __AREA_CARDS__
   <label><input type="checkbox" id="f-fixer"> Fixer-upper</label>
   <label><input type="checkbox" id="f-warehouse"> Warehouse/unique</label>
   <label><input type="checkbox" id="f-living"> Big living/windows</label>
-  <label><input type="checkbox" id="f-new"> New today</label>
-  <label><input type="checkbox" id="f-dropped"> Price drops</label>
+  <label><input type="checkbox" id="f-dropped"> Price drops (ever)</label>
   <label><input type="checkbox" id="f-value"> Good value</label>
   <label><input type="checkbox" id="f-hide-sstc"> Hide sold/under offer</label>
   <label><input type="checkbox" id="f-hide-stale"> Hide stale (not re-seen in __STALE_DAYS__+ days)</label>
@@ -1337,9 +1360,14 @@ function safeUrl(u) {
   return /^https?:\/\//i.test(u) ? escapeHtml(u) : '#';
 }
 
+function dropText(r) {
+  return (r.dropped_last_run && r.prev_price && r.price)
+    ? 'PRICE DROP −£' + (r.prev_price - r.price).toLocaleString() : 'PRICE DROP';
+}
+
 function badgesHtml(r) {
   return (r.is_new ? '<span class="badge badge-new">NEW</span>' : '')
-    + ((r.price_dropped || r.is_reduced) ? '<span class="badge badge-drop">PRICE DROP</span>' : '')
+    + ((r.price_dropped || r.is_reduced) ? '<span class="badge badge-drop">' + dropText(r) + '</span>' : '')
     + (r.good_value ? '<span class="badge badge-value">GOOD VALUE</span>' : '')
     + (r.is_sstc ? '<span class="badge badge-sstc">SOLD/UNDER OFFER</span>' : '')
     + (r.is_stale ? '<span class="badge badge-sstc">STALE</span>' : '')
@@ -1411,6 +1439,9 @@ document.getElementById('sort-select').addEventListener('change', (e) => {
   render();
 });
 
+document.getElementById('n-new').textContent = DATA.filter(r => r.is_new).length;
+document.getElementById('n-droplast').textContent = DATA.filter(r => r.dropped_last_run).length;
+
 let sortKey = "first_seen", sortAsc = false;
 
 function filterToArea(area) {
@@ -1426,7 +1457,7 @@ function filterToArea(area) {
 function resetFilters() {
   document.getElementById('area-select').value = "";
   document.getElementById('status-select').value = "";
-  ['f-fixer','f-warehouse','f-living','f-new','f-dropped','f-value','f-hide-sstc','f-hide-stale','f-watchlist'].forEach(id => {
+  ['f-fixer','f-warehouse','f-living','f-new','f-droplast','f-dropped','f-value','f-hide-sstc','f-hide-stale','f-watchlist'].forEach(id => {
     document.getElementById(id).checked = false;
   });
   document.getElementById('f-maxsc').value = '';
@@ -1442,6 +1473,7 @@ function render() {
   const fWarehouse = document.getElementById('f-warehouse').checked;
   const fLiving = document.getElementById('f-living').checked;
   const fNew = document.getElementById('f-new').checked;
+  const fDropLast = document.getElementById('f-droplast').checked;
   const fDropped = document.getElementById('f-dropped').checked;
   const fValue = document.getElementById('f-value').checked;
   const fHideSstc = document.getElementById('f-hide-sstc').checked;
@@ -1457,6 +1489,7 @@ function render() {
     if (fWarehouse && !r.tags.includes('warehouse/unique')) return false;
     if (fLiving && !r.tags.includes('big-living/windows')) return false;
     if (fNew && !r.is_new) return false;
+    if (fDropLast && !r.dropped_last_run) return false;
     if (fDropped && !(r.price_dropped || r.is_reduced)) return false;
     if (fValue && !r.good_value) return false;
     if (fHideSstc && r.is_sstc) return false;
@@ -1491,7 +1524,7 @@ function render() {
       <td>${escapeHtml(r.area || '-')}</td>
       <td><a class="listing-link" href="${safeUrl(r.url)}" target="_blank" rel="noopener">${escapeHtml(r.title)}</a>
         ${r.is_new ? '<span class="badge badge-new">NEW</span>' : ''}
-        ${(r.price_dropped || r.is_reduced) ? '<span class="badge badge-drop">PRICE DROP</span>' : ''}
+        ${(r.price_dropped || r.is_reduced) ? '<span class="badge badge-drop">' + dropText(r) + '</span>' : ''}
         ${r.good_value ? '<span class="badge badge-value">GOOD VALUE</span>' : ''}
         ${r.is_sstc ? '<span class="badge badge-sstc">SOLD/UNDER OFFER</span>' : ''}
         ${r.is_stale ? '<span class="badge badge-sstc">STALE</span>' : ''}
@@ -1534,7 +1567,7 @@ document.querySelectorAll('th[data-key]').forEach(th => {
   });
 });
 ['f-maxsc'].forEach(id => document.getElementById(id).addEventListener('input', render));
-['area-select','status-select','f-fixer','f-warehouse','f-living','f-new','f-dropped','f-value','f-hide-sstc','f-hide-stale','f-watchlist'].forEach(id =>
+['area-select','status-select','f-fixer','f-warehouse','f-living','f-new','f-droplast','f-dropped','f-value','f-hide-sstc','f-hide-stale','f-watchlist'].forEach(id =>
   document.getElementById(id).addEventListener('change', render)
 );
 
